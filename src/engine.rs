@@ -155,11 +155,15 @@ fn log(msg: impl AsRef<str>) {
 /// Never let indexing download iCloud placeholders: on the calling thread,
 /// opening or listing a dataless file fails fast instead of materializing it.
 pub fn no_materialize() {
-    unsafe extern "C" {
-        fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+    // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, OFF.
+    // The call is macOS-only; Linux CI builds the crate to run semantic tests.
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+        }
+        unsafe { setiopolicy_np(3, 1, 1) };
     }
-    // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, OFF
-    unsafe { setiopolicy_np(3, 1, 1) };
 }
 
 /// Searches run here, at user-interactive QoS: an app's background executor
@@ -180,7 +184,7 @@ fn pool() -> &'static rayon::ThreadPool {
         rayon::ThreadPoolBuilder::new()
             .thread_name(|i| format!("fsearch-search-{i}"))
             .start_handler(|_| {
-                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+                unsafe { crate::qos::pthread_set_qos_class_self_np(crate::qos::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
                 crate::alloc::keep_on_this_thread();
             })
             .build()
@@ -203,7 +207,7 @@ fn warmer() -> &'static std::thread::Thread {
     static T: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
     T.get_or_init(|| {
         let t = std::thread::Builder::new().name("fsearch-warm".into()).spawn(|| {
-            unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+            unsafe { crate::qos::pthread_set_qos_class_self_np(crate::qos::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
             loop {
                 let (from, until, now) = (WARM_FROM.load(Ordering::SeqCst), WARM_UNTIL.load(Ordering::SeqCst), now_ns());
                 if now >= until {
@@ -767,11 +771,11 @@ pub fn has_full_disk_access() -> bool {
     std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
 }
 
-fn content_pool(threads: usize, qos: libc::qos_class_t) -> rayon::ThreadPool {
+fn content_pool(threads: usize, qos: crate::qos::qos_class_t) -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .start_handler(move |_| unsafe {
-            libc::pthread_set_qos_class_self_np(qos, 0);
+            crate::qos::pthread_set_qos_class_self_np(qos, 0);
             no_materialize();
         })
         .build()
@@ -781,8 +785,8 @@ fn content_pool(threads: usize, qos: libc::qos_class_t) -> rayon::ThreadPool {
 fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
     // Indexing file contents is background work: utility QoS keeps it off
     // the user's way (lower CPU priority and IO tier).
-    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
-    let pool = content_pool(4, libc::qos_class_t::QOS_CLASS_UTILITY);
+    unsafe { crate::qos::pthread_set_qos_class_self_np(crate::qos::qos_class_t::QOS_CLASS_UTILITY, 0) };
+    let pool = content_pool(4, crate::qos::qos_class_t::QOS_CLASS_UTILITY);
     let home = shared.home.as_bytes().to_vec();
     // First run, while the whole disk is listed: index the folders searches
     // ask about from their early indexes. (A request that comes as the
@@ -887,7 +891,7 @@ fn sync_wants(shared: &Shared, pool: &rayon::ThreadPool, wants: Vec<(Vec<u8>, bo
     let fast;
     let pool = if first {
         let threads = std::thread::available_parallelism().map_or(8, |n| n.get()).min(8);
-        fast = content_pool(threads, libc::qos_class_t::QOS_CLASS_USER_INITIATED);
+        fast = content_pool(threads, crate::qos::qos_class_t::QOS_CLASS_USER_INITIATED);
         &fast
     } else {
         pool
@@ -951,6 +955,7 @@ fn full_build(shared: &Shared, event_id: u64) -> Index {
     if saved.is_ok() { Index::load(&path).unwrap_or(idx) } else { idx }
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
 }
@@ -958,7 +963,10 @@ unsafe extern "C" {
 /// Hand freed allocator memory back to the OS after big transient work
 /// (index builds, content batches) instead of letting malloc cache it.
 fn release_memory() {
-    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        malloc_zone_pressure_relief(std::ptr::null_mut(), 0)
+    };
 }
 
 fn compact(shared: &Shared) {
@@ -1730,6 +1738,7 @@ mod tests {
     /// save it asks for would clear its record (the skipped file) while
     /// the restoration still waits, and a restart would lose both.
     #[test]
+    #[cfg(target_os = "macos")]
     fn restoration_is_not_deferred() {
         let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-restore-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -1883,6 +1892,7 @@ mod tests {
     /// lacked: queued events, so the save it asks for must wait until they
     /// are applied, or its record (the skipped file) goes without them.
     #[test]
+    #[cfg(target_os = "macos")]
     fn takeover_applies_the_restoration_before_it_saves() {
         let d = std::env::temp_dir().canonicalize().unwrap().join(format!("fsearch-takeover-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);

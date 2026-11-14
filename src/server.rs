@@ -3,6 +3,8 @@
 
 use crate::frecency::{self, Frecency};
 use crate::git::{self, Git};
+#[cfg(feature = "semantic")]
+use fsearch::Grep;
 use fsearch::walk::{KIND_DIR, KIND_FILE, KIND_LINK, KIND_OTHER};
 use fsearch::{Engine, Found, GrepMode, Options, Query};
 use regex::bytes::Regex;
@@ -32,6 +34,8 @@ pub fn serve(dir: PathBuf, home: String) {
     let _ = lock.set_len(0).and_then(|_| write!(lock, "{}", std::process::id()));
     let git = Git::new(&home);
     git::kill_on_term();
+    #[cfg(feature = "semantic")]
+    let semantic_home = home.clone();
     let engine = match Engine::start(Options { dir: dir.clone(), home, skip: None }) {
         Ok(e) => e,
         Err(e) => {
@@ -41,7 +45,17 @@ pub fn serve(dir: PathBuf, home: String) {
     };
     let g = git.clone();
     engine.on_change(move |dirs| g.changed(dirs));
-    let cx = Arc::new(Ctx { engine, git, frecency: Frecency::load(dir.join("frecency")) });
+    #[cfg(feature = "semantic")]
+    let semantic = SemanticSlot::new(dir.clone(), semantic_home);
+    #[cfg(feature = "semantic")]
+    hook_semantic(&engine, &semantic, &dir);
+    let cx = Arc::new(Ctx {
+        engine,
+        git,
+        frecency: Frecency::load(dir.join("frecency")),
+        #[cfg(feature = "semantic")]
+        semantic,
+    });
     let sock = socket_path(&dir);
     let _ = std::fs::remove_file(&sock);
     let listener = match UnixListener::bind(&sock) {
@@ -63,6 +77,46 @@ struct Ctx {
     engine: Engine,
     git: Arc<Git>,
     frecency: Arc<Frecency>,
+    /// Present even when background indexing is off: a semantic request
+    /// starts it. The filesystem hook is registered only when enabled.
+    #[cfg(feature = "semantic")]
+    semantic: SemanticSlot,
+}
+
+#[cfg(feature = "semantic")]
+struct SemanticSlot {
+    dir: PathBuf,
+    home: String,
+    inner: std::sync::Mutex<Option<Arc<fsearch::semantic::Service>>>,
+}
+
+#[cfg(feature = "semantic")]
+impl SemanticSlot {
+    fn new(dir: PathBuf, home: String) -> SemanticSlot {
+        SemanticSlot { dir, home, inner: std::sync::Mutex::new(None) }
+    }
+
+    fn get(&self) -> Result<Arc<fsearch::semantic::Service>, String> {
+        let mut slot = self.inner.lock().unwrap();
+        if let Some(svc) = slot.as_ref() {
+            return Ok(svc.clone());
+        }
+        let svc = fsearch::semantic::Service::start(&self.dir, &self.home)?;
+        *slot = Some(svc.clone());
+        Ok(svc)
+    }
+}
+
+#[cfg(feature = "semantic")]
+fn hook_semantic(engine: &Engine, slot: &SemanticSlot, dir: &Path) {
+    match fsearch::semantic::Config::load(dir) {
+        Ok(cfg) if cfg.enabled => match slot.get() {
+            Ok(svc) => engine.on_change(move |dirs| svc.note(dirs)),
+            Err(e) => eprintln!("{} semantic index not started: {e}", fsearch::query::now_secs()),
+        },
+        Ok(_) => {}
+        Err(e) => eprintln!("{} semantic config ignored: {e}", fsearch::query::now_secs()),
+    }
 }
 
 fn try_lock(f: &std::fs::File) -> bool {
@@ -100,7 +154,10 @@ const WARM: Duration = Duration::from_millis(250);
 
 fn handle(mut conn: UnixStream, cx: &Ctx) {
     // Content searches run on this thread: keep them on performance cores.
-    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
     let Ok(r) = conn.try_clone() else { return };
     let mut out = Vec::new();
     for line in BufReader::new(r).lines() {
@@ -239,6 +296,10 @@ fn run(v: &Value, cx: &Ctx) -> Result<Reply, String> {
                 "changed": snap.map(|s| s.files.values().chain(s.dirs.values()).filter(|&&b| b & git::IGNORED == 0).count()),
             })))
         }
+        #[cfg(feature = "semantic")]
+        "semantic" => semantic_op(v, cx).map(Reply::Value),
+        #[cfg(not(feature = "semantic"))]
+        "semantic" => Err("this fsearch was built without semantic search; rebuild with --features semantic".into()),
         "status" => {
             let s = engine.status();
             if !s.ready {
@@ -864,6 +925,222 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
         out["next"] = n.into();
     }
     Ok(out)
+}
+
+#[cfg(feature = "semantic")]
+fn semantic_op(v: &Value, cx: &Ctx) -> Result<Value, String> {
+    let svc = cx.semantic.get()?;
+    let action = v.get("action").and_then(Value::as_str).unwrap_or(if v.get("q").is_some() { "search" } else { "status" });
+    match action {
+        "status" => semantic_status(&svc),
+        "reset" => {
+            svc.reset()?;
+            semantic_status(&svc)
+        }
+        "index" => {
+            if v.get("reset") == Some(&Value::Bool(true)) {
+                svc.reset()?;
+            }
+            let paths = semantic_paths(v)?;
+            for p in &paths {
+                svc.index_path(&real(p), true)?;
+            }
+            if v.get("wait") == Some(&Value::Bool(true)) {
+                svc.wait_idle(Duration::from_secs(600))?;
+            }
+            let mut s = semantic_status(&svc)?;
+            s["queued"] = json!(paths);
+            Ok(s)
+        }
+        "search" => semantic_search(v, cx, &svc),
+        other => Err(format!("unknown semantic action {other}")),
+    }
+}
+
+#[cfg(feature = "semantic")]
+fn semantic_status(svc: &fsearch::semantic::Service) -> Result<Value, String> {
+    let mut s = serde_json::to_value(svc.status()?).map_err(|e| e.to_string())?;
+    s["ok"] = true.into();
+    Ok(s)
+}
+
+#[cfg(feature = "semantic")]
+fn semantic_paths(v: &Value) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    if let Some(p) = v.get("path").and_then(Value::as_str) {
+        out.push(p.to_string());
+    }
+    if let Some(Value::Array(a)) = v.get("paths") {
+        for p in a {
+            let Some(p) = p.as_str() else { return Err("paths must be strings".into()) };
+            out.push(p.to_string());
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "semantic")]
+fn semantic_search(v: &Value, cx: &Ctx, svc: &fsearch::semantic::Service) -> Result<Value, String> {
+    let q = v.get("q").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).ok_or("semantic needs a q")?;
+    let limit = v.get("limit").and_then(Value::as_u64).unwrap_or(10).clamp(1, 50) as usize;
+    let mode = v.get("mode").and_then(Value::as_str).unwrap_or("hybrid");
+    if mode != "hybrid" && mode != "vector" {
+        return Err("mode must be hybrid or vector".into());
+    }
+    let under = v.get("in").and_then(Value::as_str).map(real);
+    let t = Instant::now();
+    let (hits, vector_error) = if mode == "vector" {
+        let hits = svc.search(q, limit, under.as_deref())?;
+        (hits.into_iter().map(semantic_hit_value).collect::<Vec<_>>(), None)
+    } else {
+        let wide = limit.saturating_mul(4).max(limit);
+        let (vector, vector_error) = match svc.vector_ranked(q, wide, under.as_deref()) {
+            Ok(rows) => (rows, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        let names = lexical_names(&cx.engine, q, under.as_deref(), wide);
+        let greps = lexical_grep(&cx.engine, q, under.as_deref(), wide);
+        let fused = fsearch::semantic::fuse(&[vector, names, greps], fsearch::semantic::RRF_K, limit);
+        (fused.into_iter().map(semantic_fused_value).collect(), vector_error)
+    };
+    let mut out = json!({
+        "ok": true,
+        "mode": mode,
+        "took_us": t.elapsed().as_micros() as u64,
+        "hits": hits,
+    });
+    if let Some(e) = vector_error {
+        out["vector_error"] = e.into();
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "semantic")]
+struct SemanticRow<'a> {
+    path: &'a str,
+    snippet: &'a str,
+    line_start: u32,
+    line_end: u32,
+    byte_start: u64,
+    byte_end: u64,
+    score: f32,
+    vector_score: Option<f32>,
+    lexical_score: Option<f32>,
+}
+
+#[cfg(feature = "semantic")]
+fn semantic_hit_value(h: fsearch::semantic::Hit) -> Value {
+    semantic_row(SemanticRow {
+        path: &h.path,
+        snippet: &h.snippet,
+        line_start: h.line_start,
+        line_end: h.line_end,
+        byte_start: h.byte_start,
+        byte_end: h.byte_end,
+        score: h.score,
+        vector_score: h.vector_score,
+        lexical_score: h.lexical_score,
+    })
+}
+
+#[cfg(feature = "semantic")]
+fn semantic_fused_value(h: fsearch::semantic::Fused) -> Value {
+    semantic_row(SemanticRow {
+        path: &h.path,
+        snippet: &h.snippet,
+        line_start: h.line_start,
+        line_end: h.line_end,
+        byte_start: h.byte_start,
+        byte_end: h.byte_end,
+        score: h.score,
+        vector_score: h.vector_score,
+        lexical_score: h.lexical_score,
+    })
+}
+
+#[cfg(feature = "semantic")]
+fn semantic_row(row: SemanticRow<'_>) -> Value {
+    let mut out = json!({
+        "path": row.path,
+        "snippet": clip_snippet(row.snippet),
+        "line_start": row.line_start,
+        "line_end": row.line_end,
+        "byte_start": row.byte_start,
+        "byte_end": row.byte_end,
+        "score": row.score,
+    });
+    if let Some(s) = row.vector_score {
+        out["vector_score"] = json!(s);
+    }
+    if let Some(s) = row.lexical_score {
+        out["lexical_score"] = json!(s);
+    }
+    out
+}
+
+#[cfg(feature = "semantic")]
+fn clip_snippet(s: &str) -> String {
+    const N: usize = 320;
+    if s.chars().count() <= N {
+        return s.to_string();
+    }
+    let end = s.char_indices().nth(N).map(|(i, _)| i).unwrap_or(s.len());
+    format!("{}…", &s[..end])
+}
+
+#[cfg(feature = "semantic")]
+fn lexical_names(engine: &Engine, q: &str, under: Option<&[u8]>, limit: usize) -> Vec<fsearch::semantic::Ranked> {
+    let words: Vec<&str> = q.split_whitespace().filter(|w| !w.contains(':') && w.chars().count() >= 2).take(8).collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let Ok(mut query) = Query::parse(&words.join(" "), engine.home()) else { return Vec::new() };
+    query.limit = limit;
+    if let Some(root) = under {
+        query.scope = Some(root.to_vec());
+    }
+    let Ok(found) = engine.search(&query) else { return Vec::new() };
+    found
+        .into_iter()
+        .map(|f| fsearch::semantic::Ranked {
+            path: f.path.to_string_lossy().into_owned(),
+            snippet: String::new(),
+            byte_start: 0,
+            byte_end: 0,
+            line_start: 0,
+            line_end: 0,
+            score: f.score as f32,
+        })
+        .collect()
+}
+
+#[cfg(feature = "semantic")]
+fn lexical_grep(engine: &Engine, q: &str, under: Option<&[u8]>, limit: usize) -> Vec<fsearch::semantic::Ranked> {
+    if q.contains('\n') || q.chars().count() > 200 {
+        return Vec::new();
+    }
+    let Ok(g) = Grep::new(q, GrepMode::Literal) else { return Vec::new() };
+    let Ok(mut query) = Query::parse("", engine.home()) else { return Vec::new() };
+    query.limit = limit;
+    if let Some(root) = under {
+        query.scope = Some(root.to_vec());
+    }
+    let Ok((res, _)) = engine.grep(&query, &g) else { return Vec::new() };
+    res.files
+        .into_iter()
+        .map(|f| {
+            let (line, text) = f.lines.first().cloned().unwrap_or((0, String::new()));
+            fsearch::semantic::Ranked {
+                path: String::from_utf8_lossy(&f.path).into_owned(),
+                snippet: text,
+                byte_start: 0,
+                byte_end: 0,
+                line_start: line as u32,
+                line_end: line as u32,
+                score: 1.0,
+            }
+        })
+        .collect()
 }
 
 /// `q` is the query language; any filter key may also be given as its own

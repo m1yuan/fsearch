@@ -1,0 +1,24 @@
+# Pins for scripts/convert_embeddinggemma2.py.
+# These match the Anemll EmbeddingGemma 2 Core AI export and cowboycoderhq's
+# ANE build. Do not float them: coreai-torch 0.4.3+ changed the converter,
+# and Apple's own macOS `coreai.embedding.export` preset is 4-bit and prefers
+# the GPU. This script does not call that preset.
+#
+# Install on the Mac that will convert (Python 3.13, Apple Silicon, macOS 27):
+#   python3.13 -m venv .venv-eg2
+#   .venv-eg2/bin/python -m pip install -r scripts/requirements-embeddinggemma2.txt
+#
+# coremltools is imported only for --also-coreml. The pin is the 8.x line
+# that FluidInference's Core ML packages were built with; a newer 8.x is fine
+# if 8.3.0 is not published for your Python.
+
+torch==2.11.0
+coreai-core==1.0.0b2
+coreai-torch==0.4.2
+coreai-opt==0.2.1
+transformers==5.19.0
+sentence-transformers==6.1.0
+huggingface_hub==0.36.0
+safetensors==0.6.2
+numpy==2.2.6
+coremltools==8.3.0

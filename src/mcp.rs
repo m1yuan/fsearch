@@ -125,7 +125,7 @@ impl Session {
                         "protocolVersion": version,
                         "capabilities": {"tools": {}},
                         "serverInfo": {"name": "fsearch", "version": env!("CARGO_PKG_VERSION")},
-                        "instructions": INSTRUCTIONS,
+                        "instructions": instructions(),
                     }),
                 )
             }
@@ -138,6 +138,8 @@ impl Session {
                     "find_files" => self.find_files(args),
                     "grep" => self.grep(args, false),
                     "multi_grep" => self.grep(args, true),
+                    #[cfg(feature = "semantic")]
+                    "semantic_search" => self.semantic_search(args),
                     other => return Some(error(id, -32602, &format!("unknown tool {other}"))),
                 };
                 let (text, is_error) = match r {
@@ -540,6 +542,39 @@ impl Session {
         }
         Ok(v.list_matches(&r, &pattern, regex, if regex { None } else { def_name(&pattern) }, mode, max, context, offset, note))
     }
+
+    #[cfg(feature = "semantic")]
+    fn semantic_search(&self, a: &Value) -> Result<String, String> {
+        let query = arg_str(a, &["query", "q"]).filter(|s| !s.trim().is_empty()).ok_or("semantic_search needs a query")?;
+        let max = arg_num(a, "maxResults", 10).clamp(1, 50);
+        let mode = a["mode"].as_str().unwrap_or("hybrid");
+        let scope = self.scope(a);
+        let mut req = json!({"op": "semantic", "q": query, "limit": max, "mode": mode});
+        if let Some(s) = &scope {
+            req["in"] = s.as_str().into();
+        }
+        let r = self.ask(&req)?;
+        let v = self.view(&scope);
+        let mut out: Vec<String> = v.head.iter().cloned().collect();
+        if let Some(err) = r["vector_error"].as_str() {
+            out.push(format!("vector search unavailable ({err}); lexical only:"));
+        }
+        let hits = r["hits"].as_array().cloned().unwrap_or_default();
+        if hits.is_empty() {
+            out.push(format!("0 semantic hits for '{query}'"));
+            return Ok(out.join("\n"));
+        }
+        for h in hits {
+            let path = v.show(h["path"].as_str().unwrap_or(""));
+            let loc = match (h["line_start"].as_u64(), h["line_end"].as_u64()) {
+                (Some(a), Some(b)) if a > 0 => format!(":{a}-{b}"),
+                _ => String::new(),
+            };
+            let snippet = h["snippet"].as_str().unwrap_or("").replace('\n', " ");
+            out.push(format!("{path}{loc} {}", clip(&snippet, "", 160)));
+        }
+        Ok(out.join("\n"))
+    }
 }
 
 /// Put `defs` (files with definitions) first in `r`'s files, merging lines
@@ -780,6 +815,14 @@ impl Out {
     }
 }
 
+fn instructions() -> String {
+    #[cfg_attr(not(feature = "semantic"), allow(unused_mut))]
+    let mut s = INSTRUCTIONS.to_string();
+    #[cfg(feature = "semantic")]
+    s.push_str("\n- semantic_search: meaning, paraphrases, and questions over indexed text. grep stays the default for an identifier or a literal.");
+    s
+}
+
 fn tools() -> Value {
     let common = |extra: Value| {
         let mut p = json!({
@@ -795,7 +838,8 @@ fn tools() -> Value {
         "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Default content."},
     });
     let ro = json!({"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false});
-    json!([
+    #[cfg_attr(not(feature = "semantic"), allow(unused_mut))]
+    let mut v = json!([
         {
             "name": "find_files",
             "description": "Find files by name: fuzzy and typo-tolerant, over the whole path. Use it to locate a file or see which files exist; use grep for contents. All words must match. Inline filters: *.rs, src/, src/**/*.rs, !test/, git:modified. A lone 'name/' finds folders; an empty query lists files changed in git, then those worked on lately.",
@@ -830,7 +874,21 @@ fn tools() -> Value {
             }), "required": ["patterns"]},
             "annotations": ro,
         },
-    ])
+    ]);
+    #[cfg(feature = "semantic")]
+    if let Some(a) = v.as_array_mut() {
+        a.push(json!({
+            "name": "semantic_search",
+            "description": "Search by meaning over the files fsearch indexes (hybrid: vector similarity fused with filename and content search). Use it for a question or a paraphrase. Use grep for an identifier or an exact string. Needs the local embeddings sidecar.",
+            "inputSchema": {"type": "object", "properties": common(json!({
+                "query": {"type": "string", "description": "Natural-language query."},
+                "mode": {"type": "string", "enum": ["hybrid", "vector"], "description": "Default hybrid."},
+                "maxResults": {"type": "number", "description": "Default 10."},
+            })), "required": ["query"]},
+            "annotations": ro,
+        }));
+    }
+    v
 }
 
 /// The first of `keys` given as a string.

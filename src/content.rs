@@ -3132,7 +3132,7 @@ fn helpers() -> &'static Helpers {
             let spawned = std::thread::Builder::new().name(format!("fsearch-help-{i}")).spawn(move || {
                 // Someone is waiting: keep off the slow cores and out of the
                 // throttled IO tiers, and never download iCloud placeholders.
-                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
+                unsafe { crate::qos::pthread_set_qos_class_self_np(crate::qos::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
                 crate::no_materialize();
                 let mut seen = 0;
                 loop {
@@ -3491,6 +3491,7 @@ pub struct GrepResult {
 /// threads join (`readers_more`), which match what was read while at most
 /// OPENING threads open files.
 const READERS: usize = 4;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const READERS_MORE: usize = 6;
 const OPENING: usize = 4;
 
@@ -3500,21 +3501,28 @@ const OPENING: usize = 4;
 /// with the two extra threads (on efficiency cores, and the gate's waiting
 /// spins on performance ones); the M6 (2 + 4 above its 6) gains 0.85x.
 fn readers_more() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        let get = |name: &str| {
-            let name = std::ffi::CString::new(name).ok()?;
-            let (mut v, mut len) = (0i32, std::mem::size_of::<i32>());
-            let ok = unsafe { libc::sysctlbyname(name.as_ptr(), (&raw mut v).cast(), &mut len, std::ptr::null_mut(), 0) } == 0;
-            (ok && v > 0).then_some(v as usize)
-        };
-        // The levels run fastest first; the last one is the efficiency cores.
-        let fast = match get("hw.nperflevels") {
-            Some(n) if n > 1 => (0..n - 1).filter_map(|i| get(&format!("hw.perflevel{i}.physicalcpu"))).sum(),
-            _ => get("hw.physicalcpu").unwrap_or(READERS),
-        };
-        fast.clamp(READERS, READERS_MORE)
-    })
+    #[cfg(not(target_os = "macos"))]
+    {
+        READERS
+    }
+    #[cfg(target_os = "macos")]
+    {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            let get = |name: &str| {
+                let name = std::ffi::CString::new(name).ok()?;
+                let (mut v, mut len) = (0i32, std::mem::size_of::<i32>());
+                let ok = unsafe { libc::sysctlbyname(name.as_ptr(), (&raw mut v).cast(), &mut len, std::ptr::null_mut(), 0) } == 0;
+                (ok && v > 0).then_some(v as usize)
+            };
+            // The levels run fastest first; the last one is the efficiency cores.
+            let fast = match get("hw.nperflevels") {
+                Some(n) if n > 1 => (0..n - 1).filter_map(|i| get(&format!("hw.perflevel{i}.physicalcpu"))).sum(),
+                _ => get("hw.physicalcpu").unwrap_or(READERS),
+            };
+            fast.clamp(READERS, READERS_MORE)
+        })
+    }
 }
 /// Index searches reading candidates now (see READERS).
 static READING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -3537,15 +3545,21 @@ const SCAN_RUN: usize = 64;
 /// Run `f` with this thread never downloading iCloud placeholders (as the
 /// helper threads), then restore its policy.
 fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
-    unsafe extern "C" {
-        fn getiopolicy_np(iotype: i32, scope: i32) -> i32;
-        fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
-    }
-    // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD
-    let prior = unsafe { getiopolicy_np(3, 1) };
+    #[cfg(target_os = "macos")]
+    let prior = {
+        unsafe extern "C" {
+            fn getiopolicy_np(iotype: i32, scope: i32) -> i32;
+        }
+        // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD
+        unsafe { getiopolicy_np(3, 1) }
+    };
     crate::no_materialize();
     let r = f();
+    #[cfg(target_os = "macos")]
     if prior >= 0 {
+        unsafe extern "C" {
+            fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+        }
         unsafe { setiopolicy_np(3, 1, prior) };
     }
     r
@@ -3955,6 +3969,7 @@ fn defined_at(hay: &[u8], p: usize, len: usize) -> bool {
 /// The first place at or after `from` where `hay` holds `needle` (lower
 /// case) in either case; `pair` are two positions of rare bytes in it, the
 /// ones checked first.
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables, unused_mut))]
 fn find_folded(hay: &[u8], from: usize, needle: &[u8], pair: (usize, usize)) -> Option<usize> {
     let k = needle.len();
     let last = hay.len().checked_sub(k)?;
@@ -4734,10 +4749,14 @@ fn open_ahead(path: &[u8]) -> Option<std::fs::File> {
 
 /// `open_ahead`, and the file's size.
 fn open_ahead_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
-    use std::os::unix::io::AsRawFd;
     let (f, len) = open_sized(path)?;
-    let ra = libc::radvisory { ra_offset: 0, ra_count: len.min(MAX_REPO_FILE + 1) as libc::c_int };
-    unsafe { libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &ra) };
+    // F_RDADVISE is macOS. Elsewhere the read still happens, just without the hint.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let ra = libc::radvisory { ra_offset: 0, ra_count: len.min(MAX_REPO_FILE + 1) as libc::c_int };
+        unsafe { libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &ra) };
+    }
     Some((f, len))
 }
 

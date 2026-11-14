@@ -1,0 +1,22 @@
+# Linux checks for the optional semantic index. The macOS release job is
+# release.yml. Neural Engine placement is not measured here.
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --lib --bins --tests -- -D warnings
+      - run: cargo clippy --features semantic --lib --bins --tests -- -D warnings
+      - run: cargo test --lib
+      - run: cargo test --features semantic --lib
+      - run: python3 -m py_compile scripts/convert_embeddinggemma2.py scripts/semantic_accuracy.py

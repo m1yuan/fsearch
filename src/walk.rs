@@ -219,8 +219,11 @@ fn learn_cachedir(path: Option<&[u8]>, l: &Listing) {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DIR_MNTSTATUS_TRIGGER: u32 = 0x2;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const SF_FIRMLINK: u32 = 0x0080_0000;
 
 pub const KIND_FILE: u8 = 0;
@@ -424,6 +427,7 @@ fn descend<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, mut l: Listing, ct
 }
 
 /// Entries in the directory `name` (in `dir`) resolves to.
+#[cfg(target_os = "macos")]
 fn entry_count(dir: i32, name: &CString) -> Option<u32> {
     let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
     al.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
@@ -433,8 +437,14 @@ fn entry_count(dir: i32, name: &CString) -> Option<u32> {
     (r == 0).then_some(b[1])
 }
 
+#[cfg(not(target_os = "macos"))]
+fn entry_count(_dir: i32, _name: &CString) -> Option<u32> {
+    None
+}
+
 /// Is the folder at `path` a mount point, as a listing of its parent flags
 /// one (FLAG_MOUNT)?
+#[cfg(target_os = "macos")]
 pub fn is_mount(path: &[u8]) -> bool {
     let Ok(c) = CString::new(path) else { return false };
     let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
@@ -445,6 +455,11 @@ pub fn is_mount(path: &[u8]) -> bool {
     r == 0 && b[1] & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn is_mount(_path: &[u8]) -> bool {
+    false
+}
+
 fn push(l: Listing, ctx: &Ctx) {
     if ctx.disk {
         LISTED.fetch_add(l.ents.len(), Ordering::Relaxed);
@@ -453,10 +468,12 @@ fn push(l: Listing, ctx: &Ctx) {
     ctx.out[slot].lock().unwrap().push(l);
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn rd32(b: &[u8], at: usize) -> u32 {
     u32::from_ne_bytes(b[at..at + 4].try_into().unwrap())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn rd64(b: &[u8], at: usize) -> u64 {
     u64::from_ne_bytes(b[at..at + 8].try_into().unwrap())
 }
@@ -473,6 +490,7 @@ fn list_into(path: &[u8], l: &mut Listing) -> bool {
     true
 }
 
+#[cfg(target_os = "macos")]
 fn list_fd(fd: i32, l: &mut Listing) {
     let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
     al.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
@@ -509,6 +527,10 @@ fn list_fd(fd: i32, l: &mut Listing) {
     });
 }
 
+#[cfg(not(target_os = "macos"))]
+fn list_fd(_fd: i32, _l: &mut Listing) {}
+
+#[cfg(target_os = "macos")]
 fn parse_entry(b: &[u8], l: &mut Listing) {
     let common = rd32(b, 4);
     let dirattr = rd32(b, 12);
@@ -612,6 +634,8 @@ mod tests {
     /// A scan over a temp tree: CACHEDIR.TAG and node_modules children
     /// are indexed (nothing is skipped), and the tagged folder is learned.
     #[test]
+    // Directory listings come from getattrlistbulk, which is macOS.
+    #[cfg(target_os = "macos")]
     fn lazy_dirs_index_their_children() {
         // Under the ignored target/, not the temp dir: /var is a symlink
         // (O_NOFOLLOW_ANY refuses it) and /private/var a lazy prefix.
