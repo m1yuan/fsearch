@@ -533,10 +533,13 @@ pub fn lstat(path: &[u8]) -> Option<OEnt> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
     use super::*;
 
     /// An index of `root` with real paths: the folders above it as one-entry
-    /// listings, then a scan of it.
+    /// listings, then a scan of it. The scan is getattrlistbulk, so this
+    /// helper only builds on macOS.
+    #[cfg(target_os = "macos")]
     fn base_for(root: &[u8]) -> Index {
         let comps: Vec<&[u8]> = root.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
         let k = comps.len() as u32;
@@ -559,6 +562,7 @@ mod tests {
     /// arrives: what was added inside it since the save goes too, and its
     /// content is resynced.
     #[test]
+    #[cfg(target_os = "macos")]
     fn folder_gone_takes_what_was_added() {
         let d = std::env::temp_dir().join(format!("fsearch-live-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -588,6 +592,7 @@ mod tests {
     /// A recursive event on a mount point (/dev here) doesn't crawl the
     /// mounted volume: it is an entry flagged as a scan flags it.
     #[test]
+    #[cfg(target_os = "macos")]
     fn mount_point_not_crawled() {
         let live = Live::new(Index::build(vec![Listing::default()], 0, 0, b""));
         let f = live.fetch(b"/dev", true);

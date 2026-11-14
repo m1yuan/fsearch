@@ -23,7 +23,9 @@ const USAGE: &str = "usage:
                                 (needs Full Disk Access granted to ~/.local/bin/fsearch)
   fsearch uninstall             remove the login agent (keeps the index)
   fsearch version               print the version
-  fsearch bench <query...>      time a query in-process against the saved index";
+  fsearch bench <query...>      time a query in-process against the saved index
+  fsearch semantic <query...>    meaning search (hybrid; needs --features semantic)
+  fsearch semantic index [PATH...] [--status] [--wait] [--reset]";
 
 const LABEL: &str = "mt.nd.fsearch";
 
@@ -37,6 +39,7 @@ fn data_dir() -> PathBuf {
     d
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
 }
@@ -45,7 +48,10 @@ fn main() {
     // Never let a search download iCloud placeholders: opening or listing a
     // dataless file/dir fails fast instead of materializing it.
     // (IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, OFF)
-    unsafe { setiopolicy_np(3, 0, 1) };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        setiopolicy_np(3, 0, 1)
+    };
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help") => eprintln!("{USAGE}"),
@@ -58,6 +64,7 @@ fn main() {
         Some("status") => print_one(&serde_json::json!({"op": "status"}), true),
         Some("version" | "--version") => println!("fsearch {}", env!("CARGO_PKG_VERSION")),
         Some("bench") => bench(&args[1..].join(" ")),
+        Some("semantic") => semantic_cmd(&args[1..]),
         Some("install") => install(args.iter().any(|a| a == "--login")),
         Some("uninstall") => uninstall(),
         Some(_) => {
@@ -134,6 +141,120 @@ fn stdio() {
     }
 }
 
+fn semantic_cmd(args: &[String]) {
+    #[cfg(not(feature = "semantic"))]
+    {
+        let _ = args;
+        die("semantic search is not in this build; rebuild with --features semantic");
+    }
+    #[cfg(feature = "semantic")]
+    {
+        let mut raw = false;
+        let mut mode = "hybrid".to_string();
+        let mut limit: Option<u64> = None;
+        let mut folder: Option<String> = None;
+        let mut wait = false;
+        let mut reset = false;
+        let mut status = false;
+        let mut rest = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--json" => raw = true,
+                "--wait" => wait = true,
+                "--reset" => reset = true,
+                "--status" => status = true,
+                "--mode" => {
+                    i += 1;
+                    mode = args.get(i).cloned().unwrap_or_default();
+                }
+                "--limit" => {
+                    i += 1;
+                    limit = args.get(i).and_then(|s| s.parse().ok());
+                }
+                "--in" => {
+                    i += 1;
+                    folder = args.get(i).cloned();
+                }
+                "--" => {
+                    rest.extend(args[i + 1..].iter().cloned());
+                    break;
+                }
+                s if s.starts_with('-') => die(&format!("unknown flag {s}")),
+                s => rest.push(s.to_string()),
+            }
+            i += 1;
+        }
+        let req = if rest.first().is_some_and(|s| s == "index") || (status && rest.is_empty()) {
+            let paths: Vec<&String> = rest.iter().skip(usize::from(rest.first().is_some_and(|s| s == "index"))).collect();
+            if status && paths.is_empty() && !reset && !wait {
+                serde_json::json!({"op": "semantic", "action": "status"})
+            } else {
+                serde_json::json!({"op": "semantic", "action": "index", "paths": paths, "wait": wait, "reset": reset})
+            }
+        } else {
+            let q = rest.join(" ");
+            if q.trim().is_empty() {
+                die("usage: fsearch semantic <query> | fsearch semantic index [PATH...]");
+            }
+            let mut req = serde_json::json!({"op": "semantic", "q": q, "mode": mode});
+            if let Some(n) = limit {
+                req["limit"] = n.into();
+            }
+            if let Some(p) = &folder {
+                req["in"] = p.as_str().into();
+            }
+            req
+        };
+        print_semantic(&req, raw);
+    }
+}
+
+#[cfg(feature = "semantic")]
+fn print_semantic(req: &serde_json::Value, raw: bool) {
+    let mut s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
+    s.write_all(format!("{req}\n").as_bytes()).unwrap();
+    let _ = s.shutdown(std::net::Shutdown::Write);
+    let mut line = String::new();
+    BufReader::new(&s).read_line(&mut line).unwrap();
+    if raw {
+        print!("{line}");
+        return;
+    }
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+    if v["ok"] != true {
+        die(v["error"].as_str().unwrap_or("error"));
+    }
+    let hits = v["hits"].as_array();
+    if hits.is_none() {
+        println!(
+            "files {}  chunks {}  pending {}  {} {}  {}",
+            v["files"].as_u64().unwrap_or(0),
+            v["chunks"].as_u64().unwrap_or(0),
+            v["pending"].as_u64().unwrap_or(0),
+            v["dim"].as_u64().unwrap_or(0),
+            v["dtype"].as_str().unwrap_or(""),
+            v["endpoint"].as_str().unwrap_or("")
+        );
+        return;
+    }
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    for h in hits.into_iter().flatten() {
+        let path = h["path"].as_str().unwrap_or("");
+        let loc = match (h["line_start"].as_u64(), h["line_end"].as_u64()) {
+            (Some(a), Some(b)) if a > 0 => format!(":{a}-{b}"),
+            _ => String::new(),
+        };
+        let score = h["score"].as_f64().unwrap_or(0.0);
+        let snippet = h["snippet"].as_str().unwrap_or("").replace('\n', " ");
+        let _ = writeln!(out, "{path}{loc}\t{score:.4}\t{snippet}");
+    }
+    if let Some(err) = v["vector_error"].as_str() {
+        eprintln!("fsearch: vector search unavailable: {err}");
+    }
+    let _ = out.flush();
+}
+
 fn bench(qs: &str) {
     let dir = data_dir();
     let idx = index::Index::load(&dir.join("index.bin")).unwrap_or_else(|| die("no index yet; run fsearch serve"));
@@ -146,7 +267,10 @@ fn bench(qs: &str) {
     let content = grep.as_ref().map(|_| fsearch::content::Content::open_shared(dir.join("content")));
     let pool = rayon::ThreadPoolBuilder::new()
         .start_handler(|_| {
-            unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+            #[cfg(target_os = "macos")]
+            unsafe {
+                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+            };
             fsearch::alloc::keep_on_this_thread();
         })
         .build()

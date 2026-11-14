@@ -2,3 +2,11 @@ target/
 .probe/
 .livetest/
 .replaytest/
+__pycache__/
+*.pyc
+ane-embed/.build/
+*.aimodel
+*.mlpackage
+*.mlmodelc
+*.safetensors
+*.bf16

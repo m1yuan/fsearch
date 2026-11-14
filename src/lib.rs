@@ -9,7 +9,10 @@ mod engine;
 mod fsevents;
 pub mod index;
 pub mod live;
+pub(crate) mod qos;
 pub mod query;
+#[cfg(feature = "semantic")]
+pub mod semantic;
 pub mod walk;
 
 pub use content::{Case, FileMatches, Grep, GrepResult, Hit};

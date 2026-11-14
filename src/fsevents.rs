@@ -47,6 +47,7 @@ type Callback = extern "C" fn(*mut c_void, *mut c_void, usize, *mut c_void, *con
 /// it ~1 ms at launch, and only the daemon watches the disk.
 struct Api {
     create: unsafe extern "C" fn(*const c_void, Callback, *const Context, *const c_void, u64, f64, u32) -> *mut c_void,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     set_queue: unsafe extern "C" fn(*mut c_void, *mut c_void),
     start: unsafe extern "C" fn(*mut c_void) -> u8,
     stop: unsafe extern "C" fn(*mut c_void),
@@ -104,6 +105,7 @@ pub fn current_id() -> u64 {
     unsafe { (api().current_id)() }
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> *mut c_void;
     fn dispatch_queue_attr_make_with_qos_class(attr: *const c_void, qos: u32, relative_priority: i32) -> *const c_void;
@@ -176,9 +178,12 @@ pub fn watch(since: u64, tx: Sender<Vec<Event>>, stream: u32, ours: &[u8]) -> St
         // busy threads (a first build runs on every core at user-initiated
         // QoS): fseventsd drops what a client falls behind on, and the drop
         // costs a relist of every folder changed since the last sync.
-        let qos = libc::qos_class_t::QOS_CLASS_USER_INITIATED as u32;
-        let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), dispatch_queue_attr_make_with_qos_class(std::ptr::null(), qos, 0));
-        (a.set_queue)(s, q);
+        #[cfg(target_os = "macos")]
+        {
+            let qos = crate::qos::qos_class_t::QOS_CLASS_USER_INITIATED as u32;
+            let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), dispatch_queue_attr_make_with_qos_class(std::ptr::null(), qos, 0));
+            (a.set_queue)(s, q);
+        }
         (a.start)(s);
         Stream(s)
     }
